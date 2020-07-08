@@ -24,6 +24,8 @@ import com.google.gson.{Gson, GsonBuilder, JsonArray, JsonObject, JsonPrimitive}
 abstract class ColumnProfile {
   def column: String
   def completeness: Double
+  def distinctness: Double
+  def entropy: Double
   def approximateNumDistinctValues: Long
   def dataType: DataTypeInstances.Value
   def isDataTypeInferred: Boolean
@@ -34,6 +36,8 @@ abstract class ColumnProfile {
 case class StandardColumnProfile(
     column: String,
     completeness: Double,
+    distinctness: Double,
+    entropy: Double,
     approximateNumDistinctValues: Long,
     dataType: DataTypeInstances.Value,
     isDataTypeInferred: Boolean,
@@ -44,6 +48,8 @@ case class StandardColumnProfile(
 case class NumericColumnProfile(
     column: String,
     completeness: Double,
+    distinctness: Double,
+    entropy: Double,
     approximateNumDistinctValues: Long,
     dataType: DataTypeInstances.Value,
     isDataTypeInferred: Boolean,
@@ -55,7 +61,8 @@ case class NumericColumnProfile(
     minimum: Option[Double],
     sum: Option[Double],
     stdDev: Option[Double],
-    approxPercentiles: Option[Seq[Double]])
+    approxPercentiles: Option[Seq[Double]],
+    correlation: Map[String, Double])
   extends ColumnProfile
 
 case class ColumnProfiles(
@@ -86,6 +93,8 @@ object ColumnProfiles {
       }
 
       columnProfileJson.addProperty("completeness", profile.completeness)
+      columnProfileJson.addProperty("distinctness", profile.distinctness)
+      columnProfileJson.addProperty("entropy", profile.entropy)
       columnProfileJson.addProperty("approximateNumDistinctValues",
         profile.approximateNumDistinctValues)
 
@@ -121,6 +130,16 @@ object ColumnProfiles {
           numericColumnProfile.stdDev.foreach { stdDev =>
             columnProfileJson.addProperty("stdDev", stdDev)
           }
+
+          val correlations = new JsonArray()
+          numericColumnProfile.correlation.foreach { correlation =>
+            val correlationJson = new JsonObject()
+            correlationJson.add("column", new JsonPrimitive(correlation._1))
+            correlationJson.add("correlation", new JsonPrimitive(correlation._2))
+            correlations.add(correlationJson)
+          }
+
+          columnProfileJson.add("correlations", correlations)
 
           // KLL Sketch
           if (numericColumnProfile.kll.isDefined) {

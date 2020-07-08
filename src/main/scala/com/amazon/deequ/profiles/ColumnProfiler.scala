@@ -34,6 +34,8 @@ private[deequ] case class GenericColumnStatistics(
     typeDetectionHistograms: Map[String, Map[String, Long]],
     approximateNumDistincts: Map[String, Long],
     completenesses: Map[String, Double],
+    distinctness: Map[String, Double],
+    entropy: Map[String, Double],
     predefinedTypes: Map[String, DataTypeInstances.Value]) {
 
   def typeOf(column: String): DataTypeInstances.Value = {
@@ -204,7 +206,11 @@ object ColumnProfiler {
 
     val thirdPassResults = CategoricalColumnStatistics(histograms)
 
-    createProfiles(relevantColumns, genericStatistics, numericStatistics, thirdPassResults)
+    // TODO(Fabio): is this code really efficient?
+    val correlation = getCorrelation(data, genericStatistics, relevantColumns)
+
+    createProfiles(relevantColumns, genericStatistics, numericStatistics,
+      thirdPassResults, correlation)
   }
 
   private[this] def getRelevantColumns(
@@ -230,9 +236,10 @@ object ColumnProfiler {
         val name = field.name
 
         if (field.dataType == StringType && !predefinedTypes.contains(name)) {
-          Seq(Completeness(name), ApproxCountDistinct(name), DataType(name))
+          Seq(Completeness(name), ApproxCountDistinct(name), Distinctness(name),
+            Entropy(name), DataType(name))
         } else {
-          Seq(Completeness(name), ApproxCountDistinct(name))
+          Seq(Completeness(name), ApproxCountDistinct(name), Distinctness(name), Entropy(name))
         }
       }
   }
@@ -246,7 +253,8 @@ object ColumnProfiler {
         .filter { name => Set(Integral, Fractional).contains(genericStatistics.typeOf(name)) }
         .flatMap { name =>
           Seq(Minimum(name), Maximum(name), Mean(name), StandardDeviation(name),
-            Sum(name), KLLSketch(name, kllParameters = kllParameters))
+            //   Sum(name), KLLSketch(name, kllParameters = kllParameters))
+            Sum(name))
         }
     }
 
@@ -398,9 +406,19 @@ object ColumnProfiler {
         analyzer.column -> metric.value.get
       }
 
+    val entropy = results.metricMap
+      .collect { case (analyzer: Entropy, metric: DoubleMetric) =>
+        analyzer.column -> metric.value.get
+      }
+
+    val distinctness = results.metricMap
+      .collect { case (analyzer: Distinctness, metric: DoubleMetric) =>
+        analyzer.columns.head -> metric.value.get
+      }
+
     val knownTypes = schema.fields
       .filter { column => columns.contains(column.name) }
-      .filterNot { column => predefinedTypes.contains(column.name)}
+      .filterNot { column => predefinedTypes.contains(column.name) }
       .filter {
         _.dataType != StringType
       }
@@ -420,9 +438,8 @@ object ColumnProfiler {
       .toMap
 
     GenericColumnStatistics(numRecords, inferredTypes, knownTypes, typeDetectionHistograms,
-      approximateNumDistincts, completenesses, predefinedTypes)
+      approximateNumDistincts, completenesses, distinctness, entropy, predefinedTypes)
   }
-
 
   private[this] def castNumericStringColumns(
       columns: Seq[String],
@@ -655,17 +672,50 @@ object ColumnProfiler {
     }
   }
 
+  private[this] def getCorrelation(data: DataFrame,
+                                   genericStatistics: GenericColumnStatistics,
+                                   targetColumns: Seq[String]): Map[(String, String), Double] = {
+
+    val numericalCols = targetColumns
+      .filter { name => Set(Integral, Fractional).contains(genericStatistics.typeOf(name)) }
+
+    val correlationAnalyzers = numericalCols.flatMap(
+      x => numericalCols.map(
+        y => Correlation(x, y)
+      )
+    )
+
+    val analysisRunnerCorrelation = AnalysisRunner
+      .onData(data)
+      .addAnalyzers(correlationAnalyzers)
+
+    val correlationResults = analysisRunnerCorrelation.run()
+
+    correlationResults.metricMap.map(
+      result => {
+        val analyzer = result._1.asInstanceOf[Correlation]
+        val value = result._2.value.get
+
+        (analyzer.firstColumn, analyzer.secondColumn) -> value.asInstanceOf[Double]
+      }
+    )
+  }
+
+
   private[this] def createProfiles(
-      columns: Seq[String],
-      genericStats: GenericColumnStatistics,
-      numericStats: NumericColumnStatistics,
-      categoricalStats: CategoricalColumnStatistics)
-    : ColumnProfiles = {
+                                    columns: Seq[String],
+                                    genericStats: GenericColumnStatistics,
+                                    numericStats: NumericColumnStatistics,
+                                    categoricalStats: CategoricalColumnStatistics,
+                                    correlationStats: Map[(String, String), Double])
+  : ColumnProfiles = {
 
     val profiles = columns
       .map { name =>
 
         val completeness = genericStats.completenesses(name)
+        val distinctness = genericStats.distinctness(name)
+        val entropy = genericStats.entropy(name)
         val approxNumDistinct = genericStats.approximateNumDistincts(name)
         val dataType = genericStats.typeOf(name)
         val isDataTypeInferred = genericStats.inferredTypes.contains(name)
@@ -673,12 +723,19 @@ object ColumnProfiler {
 
         val typeCounts = genericStats.typeDetectionHistograms.getOrElse(name, Map.empty)
 
-        val profile = genericStats.typeOf(name) match {
+        // Select only the correlation of this column and remove the column name
+        // from the map key
+        val columnCorrelationStat = correlationStats
+          .filterKeys(pair => pair._1.equals(name))
+          .map(correlation => correlation._1._2 -> correlation._2)
 
+        val profile = genericStats.typeOf(name) match {
           case Integral | Fractional =>
             NumericColumnProfile(
               name,
               completeness,
+              distinctness,
+              entropy,
               approxNumDistinct,
               dataType,
               isDataTypeInferred,
@@ -690,12 +747,16 @@ object ColumnProfiler {
               numericStats.minima.get(name),
               numericStats.sums.get(name),
               numericStats.stdDevs.get(name),
-              numericStats.approxPercentiles.get(name))
+              numericStats.approxPercentiles.get(name),
+              columnCorrelationStat
+            )
 
           case _ =>
             StandardColumnProfile(
               name,
               completeness,
+              distinctness,
+              entropy,
               approxNumDistinct,
               dataType,
               isDataTypeInferred,
